@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecureCord</title>
+    <style>
+        body { background-color: #2c2f33; color: #ffffff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        #app { width: 400px; background: #23272a; padding: 20px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        #chat-box { height: 300px; overflow-y: auto; border: 1px solid #99aab5; padding: 10px; margin-bottom: 10px; background: #2c2f33; }
+        input { width: 70%; padding: 10px; border: none; border-radius: 4px; }
+        button { width: 25%; padding: 10px; background: #7289da; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .msg { margin: 5px 0; padding: 5px; border-radius: 4px; }
+        .sent { background: #7289da; text-align: right; }
+        .received { background: #99aab5; color: #23272a; text-align: left; }
+        .system { color: #ffcc00; font-size: 0.8em; text-align: center; }
+    </style>
+    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+</head>
+<body>
+
+<div id="app">
+    <h2 style="text-align:center">SecureCord <span style="font-size:0.5em">E2EE</span></h2>
+    <div id="status" class="system">Connecting to server...</div>
+    <div id="chat-box"></div>
+    <div style="display:flex; justify-content:space-between;">
+        <input type="text" id="messageInput" placeholder="Type a secret..." disabled>
+        <button id="sendBtn" disabled>Send</button>
+    </div>
+</div>
+
+<script>
+    // --- CONFIGURATION ---
+    // REPLACE THIS URL with your Glitch/Render server URL (e.g., "https://my-project.glitch.me")
+    const SERVER_URL = "https://secure-cord-relay.onrender.com"; 
+    
+    const socket = io(SERVER_URL);
+    
+    // --- STATE ---
+    let myKeyPair;
+    let sharedSecretKey; // This is the AES key derived from ECDH
+    
+    // --- CRYPTO HELPERS (Web Crypto API) ---
+    
+    // 1. Generate Elliptic Curve Key Pair (ECDH)
+    async function generateKeyPair() {
+        return window.crypto.subtle.generateKey(
+            { name: "ECDH", namedCurve: "P-256" },
+            true,
+            ["deriveKey"]
+        );
+    }
+
+    // 2. Derive the Shared AES-GCM Key
+    async function deriveSecretKey(privateKey, publicKey) {
+        return window.crypto.subtle.deriveKey(
+            { name: "ECDH", public: publicKey },
+            privateKey,
+            { name: "AES-GCM", length: 256 },
+            true,
+            ["encrypt", "decrypt"]
+        );
+    }
+
+    // 3. Import a Public Key received from the network
+    async function importPublicKey(jwk) {
+        return window.crypto.subtle.importKey(
+            "jwk",
+            jwk,
+            { name: "ECDH", namedCurve: "P-256" },
+            true,
+            []
+        );
+    }
+
+    // 4. Encrypt Text
+    async function encryptMessage(text) {
+        const enc = new TextEncoder();
+        const iv = window.crypto.getRandomValues(new Uint8Array(12)); // 12 bytes IV for GCM
+        const ciphertext = await window.crypto.subtle.encrypt(
+            { name: "AES-GCM", iv: iv },
+            sharedSecretKey,
+            enc.encode(text)
+        );
+        
+        // Convert buffers to base64 strings for sending over socket
+        return {
+            iv: arrayBufferToBase64(iv),
+            content: arrayBufferToBase64(ciphertext)
+        };
+    }
+
+    // 5. Decrypt Text
+    async function decryptMessage(ivStr, contentStr) {
+        const iv = base64ToArrayBuffer(ivStr);
+        const ciphertext = base64ToArrayBuffer(contentStr);
+        
+        try {
+            const decrypted = await window.crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: iv },
+                sharedSecretKey,
+                ciphertext
+            );
+            const dec = new TextDecoder();
+            return dec.decode(decrypted);
+        } catch (e) {
+            return "[Decryption Failed - Key Mismatch]";
+        }
+    }
+
+    // --- UTILS (Buffer <-> Base64) ---
+    function arrayBufferToBase64(buffer) {
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+        return window.btoa(binary);
+    }
+    function base64ToArrayBuffer(base64) {
+        const binary_string = window.atob(base64);
+        const len = binary_string.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) bytes[i] = binary_string.charCodeAt(i);
+        return bytes.buffer;
+    }
+
+    // --- MAIN LOGIC ---
+
+    async function init() {
+        // Generate my keys immediately
+        myKeyPair = await generateKeyPair();
+        const publicKeyJWK = await window.crypto.subtle.exportKey("jwk", myKeyPair.publicKey);
+
+        // Emit my public key to the room so others can derive the secret
+        socket.emit("public-key", publicKeyJWK);
+        document.getElementById('status').innerText = "Waiting for peer...";
+    }
+
+    // When we receive a Public Key from someone else
+    socket.on("public-key", async (keyData) => {
+        if (!sharedSecretKey) {
+            const otherPublicKey = await importPublicKey(keyData);
+            sharedSecretKey = await deriveSecretKey(myKeyPair.privateKey, otherPublicKey);
+            
+            // Send my key back just in case they connected after me
+            const myKeyJWK = await window.crypto.subtle.exportKey("jwk", myKeyPair.publicKey);
+            socket.emit("public-key", myKeyJWK);
+            
+            document.getElementById('status').innerText = "SECURE CONNECTION ESTABLISHED 🔒";
+            document.getElementById('messageInput').disabled = false;
+            document.getElementById('sendBtn').disabled = false;
+        }
+    });
+
+    // When we receive a secure message
+    socket.on("secure-message", async (data) => {
+        if (!sharedSecretKey) return;
+        const text = await decryptMessage(data.iv, data.content);
+        addMessage(text, 'received');
+    });
+
+    // Sending a message
+    document.getElementById('sendBtn').addEventListener('click', async () => {
+        const input = document.getElementById('messageInput');
+        const text = input.value;
+        if (!text) return;
+
+        // ENCRYPT HERE
+        const encryptedData = await encryptMessage(text);
+        
+        // Send only the encrypted blob
+        socket.emit("secure-message", encryptedData);
+        
+        addMessage(text, 'sent');
+        input.value = '';
+    });
+
+    function addMessage(text, type) {
+        const div = document.createElement('div');
+        div.className = `msg ${type}`;
+        div.innerText = text;
+        document.getElementById('chat-box').appendChild(div);
+    }
+
+    socket.on("connect", () => {
+        init();
+    });
+</script>
+
+</body>
+</html>
